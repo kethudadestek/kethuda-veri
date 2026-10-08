@@ -21,10 +21,10 @@ const now = new Date();
 const start = `01-01-${now.getFullYear() - 3}`;
 const end = `${pad(now.getDate())}-${pad(now.getMonth() + 1)}-${now.getFullYear()}`;
 
-async function fetchSeries() {
+async function getJson(path) {
   const errors = [];
   for (const base of BASES) {
-    const url = `${base.replace(/\/$/, '')}/series=${SERIES}&startDate=${start}&endDate=${end}&type=json&frequency=5`;
+    const url = `${base.replace(/\/$/, '')}/${path}`;
     try {
       const res = await fetch(url, { headers: { key: KEY, Accept: 'application/json' } });
       const text = await res.text();
@@ -33,12 +33,7 @@ async function fetchSeries() {
         continue;
       }
       try {
-        const json = JSON.parse(text);
-        if (Array.isArray(json.items) && json.items.length) {
-          console.log(`Veri alındı: ${base}`);
-          return json.items;
-        }
-        errors.push(`${base} → JSON geldi ama veri yok: ${text.slice(0, 200)}`);
+        return { json: JSON.parse(text), base };
       } catch {
         errors.push(`${base} → JSON yerine sayfa döndü (anahtar bu sistemde geçersiz olabilir): ${text.slice(0, 160).replace(/\s+/g, ' ')}`);
       }
@@ -46,10 +41,18 @@ async function fetchSeries() {
       errors.push(`${base} → bağlanılamadı: ${e.message}`);
     }
   }
-  console.error('EVDS verisi alınamadı. Denenen adresler:\n- ' + errors.join('\n- '));
-  console.error('\nÇözüm: evds3.tcmb.gov.tr adresine giriş yapıp yeni bir API anahtarı al ve GitHub\'daki EVDS_API_KEY değerini onunla değiştir.');
-  process.exit(1);
+  return { json: null, errors };
 }
+
+// Alan adları büyük/küçük harf farkıyla gelebilir
+const pick = (obj, ...names) => {
+  for (const n of names) {
+    const k = Object.keys(obj).find((x) => x.toLowerCase() === n.toLowerCase());
+    if (k && obj[k] != null && obj[k] !== '') return obj[k];
+  }
+  return undefined;
+};
+const listOf = (json) => (Array.isArray(json) ? json : Array.isArray(json?.items) ? json.items : []);
 
 // Tarih biçimleri: "2026-9", "2026-09", "09-2026", "01-09-2026"
 function parseDate(t) {
@@ -58,16 +61,90 @@ function parseDate(t) {
   if (parts.length === 3) return parts[0] > 1900 ? { y: parts[0], m: parts[1] } : { y: parts[2], m: parts[1] };
   return { y: NaN, m: NaN };
 }
+const ym = (p) => p.y * 12 + (p.m - 1);
 
-const items = await fetchSeries();
-const field = SERIES.replace(/\./g, '_');
-const points = items
-  .map((it) => ({ ...parseDate(it.Tarih), v: Number(it[field]) }))
-  .filter((p) => p.y && p.m && Number.isFinite(p.v) && p.v > 0)
-  .sort((a, b) => a.y - b.y || a.m - b.m);
+async function seriesPoints(code) {
+  const { json, errors } = await getJson(`series=${code}&startDate=${start}&endDate=${end}&type=json&frequency=5`);
+  if (!json) {
+    console.error('EVDS verisi alınamadı. Denenen adresler:\n- ' + errors.join('\n- '));
+    console.error("\nÇözüm: evds3.tcmb.gov.tr adresine giriş yapıp yeni bir API anahtarı al ve GitHub'daki EVDS_API_KEY değerini onunla değiştir.");
+    process.exit(1);
+  }
+  const field = code.replace(/\./g, '_');
+  return listOf(json)
+    .map((it) => ({ ...parseDate(it.Tarih), v: Number(it[field]) }))
+    .filter((p) => p.y && p.m && Number.isFinite(p.v) && p.v > 0)
+    .sort((a, b) => ym(a) - ym(b));
+}
+
+// TÜİK 2026'da TÜFE'nin baz yılını değiştirdi (2025=100). Eski seri durunca yenisini EVDS'te kendimiz buluruz.
+async function discoverCpiSeries() {
+  console.log('Yeni TÜFE serisi aranıyor…');
+  const cats = listOf((await getJson('categories/type=json')).json);
+  const norm = (v) => String(v ?? '').toLocaleLowerCase('tr-TR');
+  let priceCats = cats.filter((c) => norm(pick(c, 'TOPIC_TITLE_TR', 'CATEGORY_NAME')).includes('fiyat') || norm(pick(c, 'TOPIC_TITLE_ENG')).includes('price'));
+  if (!priceCats.length) priceCats = cats; // bulunamazsa hepsine bak
+  const candidates = [];
+  for (const c of priceCats) {
+    const id = pick(c, 'CATEGORY_ID', 'ID');
+    const groups = listOf((await getJson(`datagroups/mode=2&code=${id}&type=json`)).json);
+    for (const g of groups) {
+      const name = String(pick(g, 'DATAGROUP_NAME', 'DATAGROUP_NAME_ENG') ?? '');
+      const n = norm(name);
+      if (n.includes('tüketici fiyat') || n.includes('tüfe') || norm(pick(g, 'DATAGROUP_NAME_ENG')).includes('consumer price')) {
+        candidates.push({ code: pick(g, 'DATAGROUP_CODE'), name, end: String(pick(g, 'END_DATE') ?? '') });
+      }
+    }
+  }
+  console.log('Bulunan TÜFE veri grupları:\n' + candidates.map((c) => `  ${c.code} · ${c.name} · bitiş ${c.end}`).join('\n'));
+  // En güncel biten ve "2025" bazlı olanı öne al
+  candidates.sort((a, b) => (/2025/.test(b.name) ? 1 : 0) - (/2025/.test(a.name) ? 1 : 0) || b.end.localeCompare(a.end));
+  for (const g of candidates) {
+    const series = listOf((await getJson(`serieList/type=json&code=${g.code}`)).json);
+    const general = series.find((x) => /genel|general/.test(norm(pick(x, 'SERIE_NAME', 'SERIE_NAME_ENG')))) ?? series[0];
+    if (general) {
+      const code = pick(general, 'SERIE_CODE');
+      console.log(`Seçilen seri: ${code} · ${pick(general, 'SERIE_NAME')} (${g.code})`);
+      return code;
+    }
+  }
+  return null;
+}
+
+let points = await seriesPoints(SERIES);
+const isStale = (pts) => {
+  if (!pts.length) return true;
+  const l = pts[pts.length - 1];
+  return (now.getFullYear() * 12 + now.getMonth()) - ym(l) > 3;
+};
+
+if (isStale(points) && !process.env.EVDS_SERIES) {
+  const code = await discoverCpiSeries();
+  if (!code) {
+    console.error('Yeni TÜFE serisi bulunamadı. EVDS_SERIES ile seri kodunu elle ver.');
+    process.exit(1);
+  }
+  const fresh = await seriesPoints(code);
+  // Yeni seri 24 aydan kısaysa eski seriyle ortak aylardaki orana göre birleştir
+  if (fresh.length < 24 && points.length) {
+    const oldBy = new Map(points.map((p) => [ym(p), p.v]));
+    const overlap = fresh.filter((p) => oldBy.has(ym(p)));
+    if (!overlap.length) {
+      console.error('Eski ve yeni seri birleştirilemedi (ortak ay yok).');
+      process.exit(1);
+    }
+    const factor = overlap.reduce((s, p) => s + p.v / oldBy.get(ym(p)), 0) / overlap.length;
+    const firstNew = ym(fresh[0]);
+    const older = points.filter((p) => ym(p) < firstNew).map((p) => ({ ...p, v: p.v * factor }));
+    console.log(`Eski seri ${older.length} ay için ${overlap.length} ortak ayın oranıyla eklendi.`);
+    points = [...older, ...fresh];
+  } else {
+    points = fresh;
+  }
+}
 
 if (points.length < 24) {
-  console.error(`Yeterli veri yok (${points.length} ay). Seri kodu (${SERIES}) değişmiş olabilir. İlk kayıt örneği:`, JSON.stringify(items[0]));
+  console.error(`Yeterli veri yok (${points.length} ay).`);
   process.exit(1);
 }
 
