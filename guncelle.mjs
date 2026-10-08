@@ -62,6 +62,7 @@ function parseDate(t) {
   return { y: NaN, m: NaN };
 }
 const ym = (p) => p.y * 12 + (p.m - 1);
+const norm = (v) => String(v ?? '').toLocaleLowerCase('tr-TR');
 
 async function seriesPoints(code) {
   const { json, errors } = await getJson(`series=${code}&startDate=${start}&endDate=${end}&type=json&frequency=5`);
@@ -81,7 +82,6 @@ async function seriesPoints(code) {
 async function discoverCpiSeries() {
   console.log('Yeni TÜFE serisi aranıyor…');
   const cats = listOf((await getJson('categories/type=json')).json);
-  const norm = (v) => String(v ?? '').toLocaleLowerCase('tr-TR');
   let priceCats = cats.filter((c) => norm(pick(c, 'TOPIC_TITLE_TR', 'CATEGORY_NAME')).includes('fiyat') || norm(pick(c, 'TOPIC_TITLE_ENG')).includes('price'));
   if (!priceCats.length) priceCats = cats; // bulunamazsa hepsine bak
   const candidates = [];
@@ -97,76 +97,95 @@ async function discoverCpiSeries() {
     }
   }
   console.log('Bulunan TÜFE veri grupları:\n' + candidates.map((c) => `  ${c.code} · ${c.name} · bitiş ${c.end}`).join('\n'));
-  // En güncel biten ve "2025" bazlı olanı öne al
-  candidates.sort((a, b) => (/2025/.test(b.name) ? 1 : 0) - (/2025/.test(a.name) ? 1 : 0) || b.end.localeCompare(a.end));
-  for (const g of candidates) {
-    const series = listOf((await getJson(`serieList/type=json&code=${g.code}`)).json);
-    const general = series.find((x) => /genel|general/.test(norm(pick(x, 'SERIE_NAME', 'SERIE_NAME_ENG')))) ?? series[0];
-    if (general) {
-      const code = pick(general, 'SERIE_CODE');
-      console.log(`Seçilen seri: ${code} · ${pick(general, 'SERIE_NAME')} (${g.code})`);
-      return code;
+  // Arşiv, özel kapsamlı, mevsimsellikten arındırılmış, bölgesel ve ağırlık gruplarını ele;
+  // "Genel" olanı ve en güncel biteni öne al
+  const bad = /arşiv|özel kapsam|mevsim|ağırlık|bölge|il(?:lere|ler)|göstergeleri/;
+  return candidates
+    .filter((c) => !bad.test(norm(c.name)))
+    .sort((a, b) => (norm(b.name).includes('genel') ? 1 : 0) - (norm(a.name).includes('genel') ? 1 : 0) || b.end.split('-').reverse().join('').localeCompare(a.end.split('-').reverse().join('')));
+}
+
+async function seriesInGroup(group) {
+  const series = listOf((await getJson(`serieList/type=json&code=${group.code}`)).json);
+  const named = (x) => norm(pick(x, 'SERIE_NAME', 'SERIE_NAME_ENG'));
+  const general = series.find((x) => /genel|general/.test(named(x))) ?? series[0];
+  return general ? { code: pick(general, 'SERIE_CODE'), name: pick(general, 'SERIE_NAME') } : null;
+}
+
+const isStale = (pts) => !pts.length || now.getFullYear() * 12 + now.getMonth() - ym(pts[pts.length - 1]) > 3;
+const avg = (arr) => arr.reduce((s, p) => s + p.v, 0) / arr.length;
+const nextKey = (p) => (p.m === 12 ? `${p.y + 1}-01` : `${p.y}-${pad(p.m + 1)}`);
+// i. aya kadar olan verilerle hesaplanan oran (i+1. ay yenilenen kiralar için)
+const rateAt = (pts, i) => Math.round((avg(pts.slice(i - 11, i + 1)) / avg(pts.slice(i - 23, i - 11)) - 1) * 10000) / 100;
+
+const params = JSON.parse(readFileSync(FILE, 'utf8'));
+const rates = params.kira.rates;
+
+// Seriyi, TÜİK'in daha önce açıkladığı oranlarla karşılaştırarak doğrula
+function validate(pts) {
+  for (let i = pts.length - 1; i >= 23; i--) {
+    const k = nextKey(pts[i]);
+    if (rates[k] != null) {
+      const calc = rateAt(pts, i);
+      return { key: k, calc, official: rates[k], ok: Math.abs(calc - rates[k]) <= 0.15 };
     }
   }
   return null;
 }
 
-let points = await seriesPoints(SERIES);
-const isStale = (pts) => {
-  if (!pts.length) return true;
-  const l = pts[pts.length - 1];
-  return (now.getFullYear() * 12 + now.getMonth()) - ym(l) > 3;
+function splice(fresh, old) {
+  if (fresh.length >= 24 || !old.length) return fresh;
+  const oldBy = new Map(old.map((p) => [ym(p), p.v]));
+  const overlap = fresh.filter((p) => oldBy.has(ym(p)));
+  if (!overlap.length) return fresh;
+  const factor = overlap.reduce((s, p) => s + p.v / oldBy.get(ym(p)), 0) / overlap.length;
+  const firstNew = ym(fresh[0]);
+  const older = old.filter((p) => ym(p) < firstNew).map((p) => ({ ...p, v: p.v * factor }));
+  return [...older, ...fresh];
+}
+
+const base = await seriesPoints(SERIES);
+let points = null;
+const tryPoints = (label, pts) => {
+  if (pts.length < 24 || isStale(pts)) {
+    console.log(`  ✗ ${label}: ${pts.length < 24 ? `yetersiz veri (${pts.length} ay)` : 'veri güncel değil'}`);
+    return false;
+  }
+  const v = validate(pts);
+  if (!v) {
+    console.log(`  ? ${label}: karşılaştıracak resmi oran yok`);
+    return false;
+  }
+  console.log(`  ${v.ok ? '✓' : '✗'} ${label}: ${v.key} için hesap %${v.calc}, TÜİK %${v.official}`);
+  return v.ok;
 };
 
-if (isStale(points) && !process.env.EVDS_SERIES) {
-  const code = await discoverCpiSeries();
-  if (!code) {
-    console.error('Yeni TÜFE serisi bulunamadı. EVDS_SERIES ile seri kodunu elle ver.');
-    process.exit(1);
-  }
-  const fresh = await seriesPoints(code);
-  // Yeni seri 24 aydan kısaysa eski seriyle ortak aylardaki orana göre birleştir
-  if (fresh.length < 24 && points.length) {
-    const oldBy = new Map(points.map((p) => [ym(p), p.v]));
-    const overlap = fresh.filter((p) => oldBy.has(ym(p)));
-    if (!overlap.length) {
-      console.error('Eski ve yeni seri birleştirilemedi (ortak ay yok).');
-      process.exit(1);
+console.log('Seriler TÜİK oranlarıyla karşılaştırılıyor:');
+if (tryPoints(SERIES, base)) points = base;
+if (!points && !process.env.EVDS_SERIES) {
+  for (const g of await discoverCpiSeries()) {
+    const s = await seriesInGroup(g);
+    if (!s) continue;
+    const pts = splice(await seriesPoints(s.code), base);
+    if (tryPoints(`${s.code} · ${s.name} (${g.code})`, pts)) {
+      points = pts;
+      break;
     }
-    const factor = overlap.reduce((s, p) => s + p.v / oldBy.get(ym(p)), 0) / overlap.length;
-    const firstNew = ym(fresh[0]);
-    const older = points.filter((p) => ym(p) < firstNew).map((p) => ({ ...p, v: p.v * factor }));
-    console.log(`Eski seri ${older.length} ay için ${overlap.length} ortak ayın oranıyla eklendi.`);
-    points = [...older, ...fresh];
-  } else {
-    points = fresh;
   }
 }
-
-if (points.length < 24) {
-  console.error(`Yeterli veri yok (${points.length} ay).`);
+if (!points) {
+  console.error('TÜİK oranlarıyla uyuşan bir seri bulunamadı. Yeni oran yazılmadı; elle kontrol et.');
   process.exit(1);
 }
 
-// Veri güncel mi? (son ay en fazla 3 ay eski olmalı)
 const lp = points[points.length - 1];
-const ageMonths = (now.getFullYear() - lp.y) * 12 + (now.getMonth() + 1 - lp.m);
-if (ageMonths > 3) {
-  console.error(`Son veri ${lp.y}-${pad(lp.m)} tarihli, çok eski. TÜİK endeksin baz yılını değiştirmiş olabilir; EVDS_SERIES ile yeni seri kodunu ver.`);
-  process.exit(1);
-}
-
-// Son ay için: son 12 ayın ortalaması / önceki 12 ayın ortalaması
-const avg = (arr) => arr.reduce((s, p) => s + p.v, 0) / arr.length;
-const rate = Math.round((avg(points.slice(-12)) / avg(points.slice(-24, -12)) - 1) * 10000) / 100;
+const rate = rateAt(points, points.length - 1);
 
 // Bu oran bir sonraki ay yenilenen kiralara uygulanır
 const ny = lp.m === 12 ? lp.y + 1 : lp.y;
 const nm = lp.m === 12 ? 1 : lp.m + 1;
 const key = `${ny}-${pad(nm)}`;
 
-const params = JSON.parse(readFileSync(FILE, 'utf8'));
-const rates = params.kira.rates;
 console.log(`Hesaplanan: ${key} → %${rate} (son veri ${lp.y}-${pad(lp.m)})`);
 if (rates[key] != null) {
   const diff = Math.abs(rates[key] - rate);
